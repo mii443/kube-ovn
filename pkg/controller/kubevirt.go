@@ -35,6 +35,29 @@ func (c *Controller) enqueueUpdateVMIMigration(oldObj, newObj any) {
 	}
 }
 
+func (c *Controller) enqueueDeleteVMIMigration(obj any) {
+	klog.Infof("enqueueDeleteVMIMigration called, obj type: %T", obj)
+	var vmiMigration *kubevirtv1.VirtualMachineInstanceMigration
+	switch t := obj.(type) {
+	case *kubevirtv1.VirtualMachineInstanceMigration:
+		vmiMigration = t
+	case cache.DeletedFinalStateUnknown:
+		v, ok := t.Obj.(*kubevirtv1.VirtualMachineInstanceMigration)
+		if !ok {
+			klog.Warningf("unexpected object type: %T", t.Obj)
+			return
+		}
+		vmiMigration = v
+	default:
+		klog.Warningf("unexpected object type: %T", obj)
+		return
+	}
+
+	klog.Infof("enqueue delete VMI migration %s/%s for VMI %s", vmiMigration.Namespace, vmiMigration.Name, vmiMigration.Spec.VMIName)
+	// Clean up LSP migrate options when VMIMigration is deleted
+	c.handleDeleteVMIMigration(vmiMigration)
+}
+
 func (c *Controller) enqueueDeleteVM(obj any) {
 	var vm *kubevirtv1.VirtualMachine
 	switch t := obj.(type) {
@@ -102,17 +125,12 @@ func (c *Controller) handleAddOrUpdateVMIMigration(key string) error {
 
 	vmiMigration, err := c.config.KubevirtClient.VirtualMachineInstanceMigration(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			klog.V(3).Infof("VirtualMachineInstanceMigration %s not found, skipping", key)
+			return nil
+		}
 		utilruntime.HandleError(fmt.Errorf("failed to get VMI migration by key %s: %w", key, err))
 		return err
-	}
-	if vmiMigration.Status.MigrationState == nil {
-		klog.V(3).Infof("VirtualMachineInstanceMigration %s migration state is nil, skipping", key)
-		return nil
-	}
-
-	if vmiMigration.Status.MigrationState.Completed {
-		klog.V(3).Infof("VirtualMachineInstanceMigration %s migration state is completed, skipping", key)
-		return nil
 	}
 
 	vmi, err := c.config.KubevirtClient.VirtualMachineInstance(namespace).Get(context.TODO(), vmiMigration.Spec.VMIName, metav1.GetOptions{})
@@ -139,36 +157,55 @@ func (c *Controller) handleAddOrUpdateVMIMigration(key string) error {
 	portName := ovs.PodNameToPortName(vmiMigration.Spec.VMIName, vmiMigration.Namespace, util.OvnProvider)
 	switch vmiMigration.Status.Phase {
 	case kubevirtv1.MigrationScheduling:
+		// Use kubevirt.io/created-by label to list all pods related to the VMI
+		// because kubevirt.io/migrationJobUID label may not be set on target pod
 		selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
 			MatchLabels: map[string]string{
-				"kubevirt.io/migrationJobUID": string(vmiMigration.UID),
+				"kubevirt.io/created-by": string(vmi.UID),
 			},
 		})
 		if err != nil {
-			err = fmt.Errorf("failed to create label selector for migration job UID %s: %w", vmiMigration.UID, err)
+			err = fmt.Errorf("failed to create label selector for VMI %s: %w", vmi.UID, err)
 			klog.Error(err)
 			return err
 		}
 
 		pods, err := c.podsLister.Pods(vmiMigration.Namespace).List(selector)
 		if err != nil {
-			err = fmt.Errorf("failed to list pods with migration job UID %s: %w", vmiMigration.UID, err)
+			err = fmt.Errorf("failed to list pods for VMI %s: %w", vmi.UID, err)
 			klog.Error(err)
 			return err
 		}
 
 		if len(pods) > 0 {
+			// During MigrationScheduling phase, always use vmi.Status.NodeName as source node
+			// because vmi.Status.MigrationState may contain stale data from the previous migration
+			sourceNode := vmi.Status.NodeName
+
+			// Find target pod (running/pending pod scheduled on a different node than source)
 			targetPod := pods[0]
-			// During MigrationScheduling phase, use vmi.Status.NodeName if SourceNode is empty
-			// because vmi.Status.MigrationState may not be fully synchronized yet
-			sourceNode := srcNodeName
-			if sourceNode == "" {
-				sourceNode = vmi.Status.NodeName
+			found := false
+			for _, pod := range pods {
+				// Skip completed/failed pods from previous migrations
+				if pod.Status.Phase != "Running" && pod.Status.Phase != "Pending" {
+					continue
+				}
+				if pod.Spec.NodeName != "" && pod.Spec.NodeName != sourceNode {
+					targetPod = pod
+					found = true
+					break
+				}
 			}
 
-			if sourceNode == "" || targetPod.Spec.NodeName == "" || sourceNode == targetPod.Spec.NodeName {
-				klog.Warningf("VM pod %s/%s migration setup skipped, source node: %s, target node: %s (migration job UID: %s)",
-					targetPod.Namespace, targetPod.Name, sourceNode, targetPod.Spec.NodeName, vmiMigration.UID)
+			if !found {
+				klog.Warningf("target pod not found for VMI %s/%s, source node: %s, pods count: %d",
+					vmi.Namespace, vmi.Name, sourceNode, len(pods))
+				return nil
+			}
+
+			if sourceNode == "" {
+				klog.Warningf("VM pod %s/%s migration setup skipped, source node is empty (VMI: %s/%s)",
+					targetPod.Namespace, targetPod.Name, vmi.Namespace, vmi.Name)
 				return nil
 			}
 
@@ -187,8 +224,14 @@ func (c *Controller) handleAddOrUpdateVMIMigration(key string) error {
 			return nil
 		}
 	case kubevirtv1.MigrationSucceeded:
-		klog.Infof("migrate end reset options for lsp %s from %s to %s, migrated succeed", portName, srcNodeName, targetNodeName)
-		if err := c.OVNNbClient.ResetLogicalSwitchPortMigrateOptions(portName, srcNodeName, targetNodeName, false); err != nil {
+		// After migration succeeds, vmi.Status.MigrationState may be nil
+		// Use vmi.Status.NodeName as the target node (VMI is now running on the new node)
+		targetNode := targetNodeName
+		if targetNode == "" {
+			targetNode = vmi.Status.NodeName
+		}
+		klog.Infof("migrate end reset options for lsp %s from %s to %s, migrated succeed", portName, srcNodeName, targetNode)
+		if err := c.OVNNbClient.ResetLogicalSwitchPortMigrateOptions(portName, srcNodeName, targetNode, false); err != nil {
 			err = fmt.Errorf("failed to clean migrate options for lsp %s, %w", portName, err)
 			klog.Error(err)
 			return err
@@ -202,6 +245,31 @@ func (c *Controller) handleAddOrUpdateVMIMigration(key string) error {
 		}
 	}
 	return nil
+}
+
+func (c *Controller) handleDeleteVMIMigration(vmiMigration *kubevirtv1.VirtualMachineInstanceMigration) {
+	vmiName := vmiMigration.Spec.VMIName
+	namespace := vmiMigration.Namespace
+	portName := ovs.PodNameToPortName(vmiName, namespace, util.OvnProvider)
+
+	// Get VMI to determine current node
+	vmi, err := c.config.KubevirtClient.VirtualMachineInstance(namespace).Get(context.TODO(), vmiName, metav1.GetOptions{})
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			klog.Infof("VMI %s/%s not found, skip cleaning LSP migrate options", namespace, vmiName)
+			return
+		}
+		klog.Errorf("failed to get VMI %s/%s: %v", namespace, vmiName, err)
+		return
+	}
+
+	// Use VMI's current node as the target (where VM is running after migration)
+	targetNode := vmi.Status.NodeName
+	klog.Infof("VMI migration %s/%s deleted, resetting LSP %s options to node %s", namespace, vmiMigration.Name, portName, targetNode)
+
+	if err := c.OVNNbClient.ResetLogicalSwitchPortMigrateOptions(portName, "", targetNode, false); err != nil {
+		klog.Errorf("failed to reset migrate options for lsp %s on VMI migration delete: %v", portName, err)
+	}
 }
 
 func (c *Controller) isKubevirtCRDInstalled() bool {
@@ -236,9 +304,11 @@ func (c *Controller) StartKubevirtInformerFactory(ctx context.Context, kubevirtI
 						if _, err := vmiMigrationInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 							AddFunc:    c.enqueueAddVMIMigration,
 							UpdateFunc: c.enqueueUpdateVMIMigration,
+							DeleteFunc: c.enqueueDeleteVMIMigration,
 						}); err != nil {
 							util.LogFatalAndExit(err, "failed to add VMI Migration event handler")
 						}
+						klog.Info("VMI Migration event handlers registered (Add, Update, Delete)")
 					}
 
 					if _, err := vmInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
